@@ -6,19 +6,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/openshift/source-to-image/pkg/util/log"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/containers/buildah/util"
+
+	ireference "github.com/containers/image/v5/docker/reference"
+
 	"github.com/containers/buildah"
 	"github.com/containers/buildah/imagebuildah"
-	"github.com/containers/buildah/util"
-	_ "github.com/mtrmac/gpgme"
-	ireference "github.com/containers/image/v5/docker/reference"
-	"github.com/containers/image/v5/pkg/docker/config"
 	"github.com/containers/image/v5/transports/alltransports"
 	"github.com/containers/image/v5/types"
 	"github.com/containers/storage"
@@ -30,9 +29,8 @@ import (
 
 	"k8s.io/kubernetes/pkg/credentialprovider"
 
-	buildapiv1 "github.com/openshift/api/build/v1"
+	log "github.com/golang/glog"
 
-	"github.com/openshift/builder/pkg/build/builder/cmd/dockercfg"
 	builderutil "github.com/openshift/builder/pkg/build/builder/util"
 )
 
@@ -40,275 +38,8 @@ var (
 	nodeCredentialsFile = "/var/lib/kubelet/config.json"
 )
 
-// The build controller doesn't expect the CAP_ prefix to be used in the
-// entries in the list in the environment, but our runtime configuration
-// expects it to be provided, so massage the values into a suitabe list.
-func dropCapabilities() []string {
-	var dropCapabilities []string
-	if dropCaps, ok := os.LookupEnv(builderutil.DropCapabilities); ok && dropCaps != "" {
-		dropCapabilities = strings.Split(os.Getenv(builderutil.DropCapabilities), ",")
-		for i := range dropCapabilities {
-			dropCapabilities[i] = strings.ToUpper(dropCapabilities[i])
-			if !strings.HasPrefix(dropCapabilities[i], "CAP_") {
-				dropCapabilities[i] = "CAP_" + dropCapabilities[i]
-			}
-		}
-	}
-	return dropCapabilities
-}
-
-// parsePullCredentials parses credentials from provided file.
-func parsePullCredentials(credsPath string) (credentialprovider.DockerConfig, error) {
-	var creds credentialprovider.DockerConfig
-	var err error
-
-	if filepath.Base(credsPath) == dockercfg.DockerConfigKey {
-		if creds, err = credentialprovider.ReadDockercfgFile(
-			[]string{filepath.Dir(credsPath)},
-		); err != nil {
-			return nil, err
-		}
-	} else {
-		if creds, err = credentialprovider.ReadSpecificDockerConfigJsonFile(
-			credsPath,
-		); err != nil {
-			return nil, err
-		}
-	}
-
-	if creds == nil {
-		creds = make(map[string]credentialprovider.DockerConfigEntry)
-	}
-
-	return creds, nil
-}
-
-// mergeNodeCredentials merges node credentials with credentials file provided.
-func mergeNodeCredentials(credsPath string) (*credentialprovider.DockerConfigJson, error) {
-	nodeCreds, err := parsePullCredentials(nodeCredentialsFile)
-	if err != nil {
-		log.V(2).Infof("proceeding without node credentials: %v", err)
-	}
-
-	namespaceCreds, err := parsePullCredentials(credsPath)
-	if err != nil {
-		return nil, fmt.Errorf("error reading pull credentials: %v", err)
-	}
-
-	for regurl, cfg := range nodeCreds {
-		if _, ok := namespaceCreds[regurl]; !ok {
-			namespaceCreds[regurl] = cfg
-		}
-	}
-
-	return &credentialprovider.DockerConfigJson{
-		Auths: namespaceCreds,
-	}, nil
-}
-
-func pullDaemonlessImage(sc types.SystemContext, store storage.Store, imageName string, searchPaths []string, blobCacheDirectory string) error {
-	log.V(2).Infof("Asked to pull fresh copy of %q.", imageName)
-
-	if imageName == "" {
-		return fmt.Errorf("unable to pull using empty image name")
-	}
-
-	_, err := alltransports.ParseImageName("docker://" + imageName)
-	if err != nil {
-		return fmt.Errorf("error parsing image name to pull %s: %v", "docker://"+imageName, err)
-	}
-
-	mergedCreds, err := mergeNodeCredentials(
-		dockercfg.GetDockerConfigPath(searchPaths),
-	)
-	if err != nil {
-		return err
-	}
-
-	dstFile, err := ioutil.TempFile("", "config")
-	if err != nil {
-		return fmt.Errorf("error creating tmp credentials file: %v", err)
-	}
-	defer func() {
-		_ = dstFile.Close()
-		if err := os.Remove(dstFile.Name()); err != nil {
-			log.V(2).Infof("unable to remove tmp credentials file: %v", err)
-		}
-	}()
-
-	if err := json.NewEncoder(dstFile).Encode(mergedCreds); err != nil {
-		return fmt.Errorf("error encoding credentials: %v", err)
-	}
-
-	systemContext := sc
-	systemContext.AuthFilePath = dstFile.Name()
-
-	options := buildah.PullOptions{
-		ReportWriter:  os.Stderr,
-		Store:         store,
-		SystemContext: &systemContext,
-		BlobDirectory: blobCacheDirectory,
-	}
-	_, err = buildah.Pull(context.TODO(), "docker://"+imageName, options)
-	return err
-}
-
-func daemonlessProcessLimits() (defaultProcessLimits []string) {
-	rlim := unix.Rlimit{Cur: 1048576, Max: 1048576}
-	if err := unix.Setrlimit(unix.RLIMIT_NOFILE, &rlim); err == nil {
-		defaultProcessLimits = append(defaultProcessLimits, fmt.Sprintf("nofile=%d:%d", rlim.Cur, rlim.Max))
-	} else {
-		if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &rlim); err == nil {
-			defaultProcessLimits = append(defaultProcessLimits, fmt.Sprintf("nofile=%d:%d", rlim.Cur, rlim.Max))
-		}
-	}
-	rlim = unix.Rlimit{Cur: 1048576, Max: 1048576}
-	if err := unix.Setrlimit(unix.RLIMIT_NPROC, &rlim); err == nil {
-		defaultProcessLimits = append(defaultProcessLimits, fmt.Sprintf("nproc=%d:%d", rlim.Cur, rlim.Max))
-	} else {
-		if err := unix.Getrlimit(unix.RLIMIT_NPROC, &rlim); err == nil {
-			defaultProcessLimits = append(defaultProcessLimits, fmt.Sprintf("nproc=%d:%d", rlim.Cur, rlim.Max))
-		}
-	}
-	return defaultProcessLimits
-}
-
-func buildDaemonlessImage(sc types.SystemContext, store storage.Store, isolation buildah.Isolation, contextDir string, optimization buildapiv1.ImageOptimizationPolicy, opts *docker.BuildImageOptions, blobCacheDirectory string) error {
-	log.V(2).Infof("Building...")
-
-	args := make(map[string]string)
-	for _, ev := range opts.BuildArgs {
-		args[ev.Name] = ev.Value
-	}
-
-	pullPolicy := buildah.PullIfMissing
-	if opts.Pull {
-		log.V(2).Infof("Forcing fresh pull of base image.")
-		pullPolicy = buildah.PullAlways
-	}
-
-	layers := false
-	switch optimization {
-	case buildapiv1.ImageOptimizationSkipLayers, buildapiv1.ImageOptimizationSkipLayersAndWarn:
-		layers = false
-	case buildapiv1.ImageOptimizationNone:
-		layers = true
-	default:
-		return fmt.Errorf("internal error: image optimization policy %q not fully implemented", string(optimization))
-	}
-
-	systemContext := sc
-	// if credsDir, ok := os.LookupEnv("PULL_DOCKERCFG_PATH"); ok {
-	// 	systemContext.AuthFilePath = filepath.Join(credsDir, "config.json")
-	// }
-	systemContext.AuthFilePath = "/tmp/config.json"
-
-	for registry, ac := range opts.AuthConfigs.Configs {
-		log.V(5).Infof("Setting authentication for registry %q at %q.", registry, ac.ServerAddress)
-		if err := config.SetAuthentication(&systemContext, registry, ac.Username, ac.Password); err != nil {
-			return err
-		}
-		if err := config.SetAuthentication(&systemContext, ac.ServerAddress, ac.Username, ac.Password); err != nil {
-			return err
-		}
-	}
-
-	var transientMounts []string
-	if st, err := os.Stat("/run/secrets"); err == nil && st.IsDir() {
-		// Add a bind of /run/secrets, to pass along anything that the
-		// runtime mounted from the node into our /run/secrets.
-		transientMounts = append(transientMounts, "/run/secrets:/run/secrets:ro,nodev,noexec,nosuid")
-	}
-
-	options := imagebuildah.BuildOptions{
-		ContextDirectory: contextDir,
-		PullPolicy:       pullPolicy,
-		Isolation:        isolation,
-		TransientMounts:  transientMounts,
-		Args:             args,
-		Output:           opts.Name,
-		Out:              opts.OutputStream,
-		Err:              opts.OutputStream,
-		ReportWriter:     opts.OutputStream,
-		OutputFormat:     buildah.Dockerv2ImageManifest,
-		SystemContext:    &systemContext,
-		NamespaceOptions: buildah.NamespaceOptions{
-			{Name: string(specs.NetworkNamespace), Host: true},
-		},
-		CommonBuildOpts: &buildah.CommonBuildOptions{
-			HTTPProxy:    true,
-			Memory:       opts.Memory,
-			MemorySwap:   opts.Memswap,
-			CgroupParent: opts.CgroupParent,
-			Ulimit:       daemonlessProcessLimits(),
-		},
-		Layers:                  layers,
-		NoCache:                 opts.NoCache,
-		RemoveIntermediateCtrs:  opts.RmTmpContainer,
-		ForceRmIntermediateCtrs: true,
-		BlobDirectory:           blobCacheDirectory,
-		DropCapabilities:        dropCapabilities(),
-	}
-
-	_, _, err := imagebuildah.BuildDockerfiles(opts.Context, store, options, opts.Dockerfile)
-	return err
-}
-
-func tagDaemonlessImage(sc types.SystemContext, store storage.Store, buildTag, pushTag string) error {
-	log.V(2).Infof("Tagging local image %q with name %q.", buildTag, pushTag)
-
-	if buildTag == "" {
-		return fmt.Errorf("unable to add tag to image with empty image name")
-	}
-	if pushTag == "" {
-		return fmt.Errorf("unable to add empty tag to image")
-	}
-
-	systemContext := sc
-
-	_, img, err := util.FindImage(store, "", &systemContext, buildTag)
-	if err != nil {
-		return err
-	}
-	if img == nil {
-		return storage.ErrImageUnknown
-	}
-	if err := util.AddImageNames(store, "", &systemContext, img, []string{pushTag}); err != nil {
-		return err
-	}
-	log.V(2).Infof("Added name %q to local image.", pushTag)
-
-	return nil
-}
-
-func removeDaemonlessImage(sc types.SystemContext, store storage.Store, buildTag string) error {
-	log.V(2).Infof("Removing name %q from local image.", buildTag)
-
-	if buildTag == "" {
-		return fmt.Errorf("unable to remove image using empty image name")
-	}
-
-	systemContext := sc
-
-	_, img, err := util.FindImage(store, "", &systemContext, buildTag)
-	if err != nil {
-		return err
-	}
-	if img == nil {
-		return storage.ErrImageUnknown
-	}
-
-	filtered := make([]string, 0, len(img.Names))
-	for _, name := range img.Names {
-		if name != buildTag {
-			filtered = append(filtered, name)
-		}
-	}
-	if err := store.SetNames(img.ID, filtered); err != nil {
-		return err
-	}
-
-	return nil
+func (d *DaemonlessClient) BuildImage(opts docker.BuildImageOptions) error {
+	return buildDaemonlessImage(d.SystemContext, d.Store, d.Isolation, opts.ContextDir, &opts, d.BlobCacheDirectory)
 }
 
 func pushDaemonlessImage(sc types.SystemContext, store storage.Store, imageName string, authConfig docker.AuthConfiguration, blobCacheDirectory string) (string, error) {
@@ -356,6 +87,112 @@ func pushDaemonlessImage(sc types.SystemContext, store storage.Store, imageName 
 	}
 	log.V(0).Infof("Successfully pushed %s", logName)
 	return string(digest), err
+}
+
+func (d *DaemonlessClient) PushImage(opts docker.PushImageOptions, auth docker.AuthConfiguration) (string, error) {
+	imageName := opts.Name
+	if opts.Tag != "" {
+		imageName = imageName + ":" + opts.Tag
+	}
+	return pushDaemonlessImage(d.SystemContext, d.Store, imageName, auth, d.BlobCacheDirectory)
+}
+
+func removeDaemonlessImage(sc types.SystemContext, store storage.Store, buildTag string) error {
+	log.V(2).Infof("Removing name %q from local image.", buildTag)
+
+	if buildTag == "" {
+		return fmt.Errorf("unable to remove image using empty image name")
+	}
+
+	systemContext := sc
+
+	_, img, err := util.FindImage(store, "", &systemContext, buildTag)
+	if err != nil {
+		return err
+	}
+	if img == nil {
+		return storage.ErrImageUnknown
+	}
+
+	filtered := make([]string, 0, len(img.Names))
+	for _, name := range img.Names {
+		if name != buildTag {
+			filtered = append(filtered, name)
+		}
+	}
+	if err := store.SetNames(img.ID, filtered); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (d *DaemonlessClient) RemoveImage(name string) error {
+	return removeDaemonlessImage(d.SystemContext, d.Store, name)
+}
+
+func (d *DaemonlessClient) CreateContainer(opts docker.CreateContainerOptions) (*docker.Container, error) {
+	options := buildah.BuilderOptions{
+		FromImage:     opts.Config.Image,
+		Container:     opts.Name,
+		BlobDirectory: d.BlobCacheDirectory,
+	}
+	builder, err := buildah.NewBuilder(opts.Context, d.Store, options)
+	if err != nil {
+		return nil, err
+	}
+	builder.SetCmd(opts.Config.Cmd)
+	builder.SetEntrypoint(opts.Config.Entrypoint)
+	if builder.Container != "" {
+		d.builders[builder.Container] = builder
+	}
+	if builder.ContainerID != "" {
+		d.builders[builder.ContainerID] = builder
+	}
+	return &docker.Container{ID: builder.ContainerID}, nil
+}
+
+func (d *DaemonlessClient) RemoveContainer(opts docker.RemoveContainerOptions) error {
+	builder, ok := d.builders[opts.ID]
+	if !ok {
+		return errors.Errorf("no such container as %q", opts.ID)
+	}
+	name := builder.Container
+	id := builder.ContainerID
+	err := builder.Delete()
+	if err == nil {
+		if name != "" {
+			if _, ok := d.builders[name]; ok {
+				delete(d.builders, name)
+			}
+		}
+		if id != "" {
+			if _, ok := d.builders[id]; ok {
+				delete(d.builders, id)
+			}
+		}
+	}
+	return err
+}
+
+func (d *DaemonlessClient) PullImage(opts docker.PullImageOptions, searchPaths []string) error {
+	imageName := opts.Repository
+	if opts.Tag != "" {
+		imageName = imageName + ":" + opts.Tag
+	}
+	return pullDaemonlessImage(d.SystemContext, d.Store, imageName, searchPaths, d.BlobCacheDirectory)
+}
+
+func (d *DaemonlessClient) TagImage(name string, opts docker.TagImageOptions) error {
+	imageName := opts.Repo
+	if opts.Tag != "" {
+		imageName = imageName + ":" + opts.Tag
+	}
+	return tagDaemonlessImage(d.SystemContext, d.Store, name, imageName)
+}
+
+func (d *DaemonlessClient) InspectImage(name string) (*docker.Image, error) {
+	return inspectDaemonlessImage(d.SystemContext, d.Store, name)
 }
 
 func inspectDaemonlessImage(sc types.SystemContext, store storage.Store, name string) (*docker.Image, error) {
@@ -496,13 +333,51 @@ type DaemonlessClient struct {
 	Store                   storage.Store
 	Isolation               buildah.Isolation
 	BlobCacheDirectory      string
-	ImageOptimizationPolicy buildapiv1.ImageOptimizationPolicy
+	//ImageOptimizationPolicy buildapiv1.ImageOptimizationPolicy
 	builders                map[string]*buildah.Builder
 }
 
-// GetDaemonlessClient returns a valid implemenatation of the DockerClient
-// interface, or an error if the implementation couldn't be created.
-func GetDaemonlessClient(systemContext types.SystemContext, store storage.Store, isolationSpec, blobCacheDirectory string, imageOptimizationPolicy buildapiv1.ImageOptimizationPolicy) (client DockerClient, err error) {
+func tagDaemonlessImage(sc types.SystemContext, store storage.Store, buildTag, pushTag string) error {
+	log.V(2).Infof("Tagging local image %q with name %q.", buildTag, pushTag)
+
+	if buildTag == "" {
+		return fmt.Errorf("unable to add tag to image with empty image name")
+	}
+	if pushTag == "" {
+		return fmt.Errorf("unable to add empty tag to image")
+	}
+
+	systemContext := sc
+
+	_, img, err := util.FindImage(store, "", &systemContext, buildTag)
+	if err != nil {
+		return err
+	}
+	if img == nil {
+		return storage.ErrImageUnknown
+	}
+	if err := util.AddImageNames(store, "", &systemContext, img, []string{pushTag}); err != nil {
+		return err
+	}
+	log.V(2).Infof("Added name %q to local image.", pushTag)
+
+	return nil
+}
+
+// DockerClient is an interface to the Docker client that contains
+// the methods used by the common builder
+type DockerClient interface {
+	BuildImage(opts docker.BuildImageOptions) error
+	PushImage(opts docker.PushImageOptions, auth docker.AuthConfiguration) (string, error)
+	RemoveImage(name string) error
+	CreateContainer(opts docker.CreateContainerOptions) (*docker.Container, error)
+	PullImage(opts docker.PullImageOptions, authSearchPaths []string) error
+	RemoveContainer(opts docker.RemoveContainerOptions) error
+	InspectImage(name string) (*docker.Image, error)
+	TagImage(name string, opts docker.TagImageOptions) error
+}
+
+func GetDaemonlessClient(systemContext types.SystemContext, store storage.Store, isolationSpec, blobCacheDirectory string) (client DockerClient, err error) {
 	isolation := buildah.IsolationDefault
 	switch strings.ToLower(isolationSpec) {
 	case "chroot":
@@ -525,87 +400,202 @@ func GetDaemonlessClient(systemContext types.SystemContext, store storage.Store,
 		Store:                   store,
 		Isolation:               isolation,
 		BlobCacheDirectory:      blobCacheDirectory,
-		ImageOptimizationPolicy: imageOptimizationPolicy,
+//		ImageOptimizationPolicy: imageOptimizationPolicy,
 		builders:                make(map[string]*buildah.Builder),
 	}, nil
 }
 
-func (d *DaemonlessClient) BuildImage(opts docker.BuildImageOptions) error {
-	return buildDaemonlessImage(d.SystemContext, d.Store, d.Isolation, opts.ContextDir, d.ImageOptimizationPolicy, &opts, d.BlobCacheDirectory)
-}
-
-func (d *DaemonlessClient) PushImage(opts docker.PushImageOptions, auth docker.AuthConfiguration) (string, error) {
-	imageName := opts.Name
-	if opts.Tag != "" {
-		imageName = imageName + ":" + opts.Tag
+// The build controller doesn't expect the CAP_ prefix to be used in the
+// entries in the list in the environment, but our runtime configuration
+// expects it to be provided, so massage the values into a suitabe list.
+func dropCapabilities() []string {
+	var dropCapabilities []string
+	if dropCaps, ok := os.LookupEnv(builderutil.DropCapabilities); ok && dropCaps != "" {
+		dropCapabilities = strings.Split(os.Getenv(builderutil.DropCapabilities), ",")
+		for i := range dropCapabilities {
+			dropCapabilities[i] = strings.ToUpper(dropCapabilities[i])
+			if !strings.HasPrefix(dropCapabilities[i], "CAP_") {
+				dropCapabilities[i] = "CAP_" + dropCapabilities[i]
+			}
+		}
 	}
-	return pushDaemonlessImage(d.SystemContext, d.Store, imageName, auth, d.BlobCacheDirectory)
+	return dropCapabilities
 }
 
-func (d *DaemonlessClient) RemoveImage(name string) error {
-	return removeDaemonlessImage(d.SystemContext, d.Store, name)
-}
+// parsePullCredentials parses credentials from provided file.
+func parsePullCredentials(credsPath string) (credentialprovider.DockerConfig, error) {
+	var creds credentialprovider.DockerConfig
+	var err error
 
-func (d *DaemonlessClient) CreateContainer(opts docker.CreateContainerOptions) (*docker.Container, error) {
-	options := buildah.BuilderOptions{
-		FromImage:     opts.Config.Image,
-		Container:     opts.Name,
-		BlobDirectory: d.BlobCacheDirectory,
+	if filepath.Base(credsPath) == DockerConfigKey {
+		if creds, err = credentialprovider.ReadDockercfgFile(
+			[]string{filepath.Dir(credsPath)},
+		); err != nil {
+			return nil, err
+		}
+	} else {
+		if creds, err = credentialprovider.ReadSpecificDockerConfigJsonFile(
+			credsPath,
+		); err != nil {
+			return nil, err
+		}
 	}
-	builder, err := buildah.NewBuilder(opts.Context, d.Store, options)
+
+	if creds == nil {
+		creds = make(map[string]credentialprovider.DockerConfigEntry)
+	}
+
+	return creds, nil
+}
+
+// mergeNodeCredentials merges node credentials with credentials file provided.
+func mergeNodeCredentials(credsPath string) (*credentialprovider.DockerConfigJson, error) {
+	nodeCreds, err := parsePullCredentials(nodeCredentialsFile)
 	if err != nil {
-		return nil, err
+		log.V(2).Infof("proceeding without node credentials: %v", err)
 	}
-	builder.SetCmd(opts.Config.Cmd)
-	builder.SetEntrypoint(opts.Config.Entrypoint)
-	if builder.Container != "" {
-		d.builders[builder.Container] = builder
+
+	namespaceCreds, err := parsePullCredentials(credsPath)
+	if err != nil {
+		return nil, fmt.Errorf("error reading pull credentials: %v", err)
 	}
-	if builder.ContainerID != "" {
-		d.builders[builder.ContainerID] = builder
+
+	for regurl, cfg := range nodeCreds {
+		if _, ok := namespaceCreds[regurl]; !ok {
+			namespaceCreds[regurl] = cfg
+		}
 	}
-	return &docker.Container{ID: builder.ContainerID}, nil
+
+	return &credentialprovider.DockerConfigJson{
+		Auths: namespaceCreds,
+	}, nil
 }
 
-func (d *DaemonlessClient) RemoveContainer(opts docker.RemoveContainerOptions) error {
-	builder, ok := d.builders[opts.ID]
-	if !ok {
-		return errors.Errorf("no such container as %q", opts.ID)
+func pullDaemonlessImage(sc types.SystemContext, store storage.Store, imageName string, searchPaths []string, blobCacheDirectory string) error {
+	log.V(2).Infof("Asked to pull fresh copy of %q.", imageName)
+
+	if imageName == "" {
+		return fmt.Errorf("unable to pull using empty image name")
 	}
-	name := builder.Container
-	id := builder.ContainerID
-	err := builder.Delete()
-	if err == nil {
-		if name != "" {
-			if _, ok := d.builders[name]; ok {
-				delete(d.builders, name)
-			}
-		}
-		if id != "" {
-			if _, ok := d.builders[id]; ok {
-				delete(d.builders, id)
-			}
-		}
+
+	_, err := alltransports.ParseImageName("docker://" + imageName)
+	if err != nil {
+		return fmt.Errorf("error parsing image name to pull %s: %v", "docker://"+imageName, err)
 	}
+
+	mergedCreds, err := mergeNodeCredentials(
+		GetDockerConfigPath(searchPaths),
+	)
+	if err != nil {
+		return err
+	}
+
+	dstFile, err := ioutil.TempFile("", "config")
+	if err != nil {
+		return fmt.Errorf("error creating tmp credentials file: %v", err)
+	}
+	defer func() {
+		_ = dstFile.Close()
+		if err := os.Remove(dstFile.Name()); err != nil {
+			log.V(2).Infof("unable to remove tmp credentials file: %v", err)
+		}
+	}()
+
+	if err := json.NewEncoder(dstFile).Encode(mergedCreds); err != nil {
+		return fmt.Errorf("error encoding credentials: %v", err)
+	}
+
+	systemContext := sc
+	systemContext.AuthFilePath = dstFile.Name()
+
+	options := buildah.PullOptions{
+		ReportWriter:  os.Stderr,
+		Store:         store,
+		SystemContext: &systemContext,
+		BlobDirectory: blobCacheDirectory,
+	}
+	_, err = buildah.Pull(context.TODO(), "docker://"+imageName, options)
 	return err
 }
 
-func (d *DaemonlessClient) PullImage(opts docker.PullImageOptions, searchPaths []string) error {
-	imageName := opts.Repository
-	if opts.Tag != "" {
-		imageName = imageName + ":" + opts.Tag
+func daemonlessProcessLimits() (defaultProcessLimits []string) {
+	rlim := unix.Rlimit{Cur: 1048576, Max: 1048576}
+	if err := unix.Setrlimit(unix.RLIMIT_NOFILE, &rlim); err == nil {
+		defaultProcessLimits = append(defaultProcessLimits, fmt.Sprintf("nofile=%d:%d", rlim.Cur, rlim.Max))
+	} else {
+		if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &rlim); err == nil {
+			defaultProcessLimits = append(defaultProcessLimits, fmt.Sprintf("nofile=%d:%d", rlim.Cur, rlim.Max))
+		}
 	}
-	return pullDaemonlessImage(d.SystemContext, d.Store, imageName, searchPaths, d.BlobCacheDirectory)
+	rlim = unix.Rlimit{Cur: 1048576, Max: 1048576}
+	if err := unix.Setrlimit(unix.RLIMIT_NPROC, &rlim); err == nil {
+		defaultProcessLimits = append(defaultProcessLimits, fmt.Sprintf("nproc=%d:%d", rlim.Cur, rlim.Max))
+	} else {
+		if err := unix.Getrlimit(unix.RLIMIT_NPROC, &rlim); err == nil {
+			defaultProcessLimits = append(defaultProcessLimits, fmt.Sprintf("nproc=%d:%d", rlim.Cur, rlim.Max))
+		}
+	}
+	return defaultProcessLimits
 }
 
-func (d *DaemonlessClient) TagImage(name string, opts docker.TagImageOptions) error {
-	imageName := opts.Repo
-	if opts.Tag != "" {
-		imageName = imageName + ":" + opts.Tag
-	}
-	return tagDaemonlessImage(d.SystemContext, d.Store, name, imageName)
-}
+func buildDaemonlessImage(sc types.SystemContext, store storage.Store, isolation buildah.Isolation, contextDir string, opts *docker.BuildImageOptions, blobCacheDirectory string) error {
+	log.V(2).Infof("Building...")
 
-func (d *DaemonlessClient) InspectImage(name string) (*docker.Image, error) {
-	return inspectDaemonlessImage(d.SystemContext, d.Store, name)
+	args := make(map[string]string)
+	for _, ev := range opts.BuildArgs {
+		args[ev.Name] = ev.Value
+	}
+
+	pullPolicy := buildah.PullIfMissing
+	if opts.Pull {
+		log.V(2).Infof("Forcing fresh pull of base image.")
+		pullPolicy = buildah.PullAlways
+	}
+
+	layers := false
+	systemContext := sc
+	// if credsDir, ok := os.LookupEnv("PULL_DOCKERCFG_PATH"); ok {
+	// 	systemContext.AuthFilePath = filepath.Join(credsDir, "config.json")
+	// }
+	systemContext.AuthFilePath = "/tmp/config.json"
+
+	var transientMounts []string
+	if st, err := os.Stat("/run/secrets"); err == nil && st.IsDir() {
+		// Add a bind of /run/secrets, to pass along anything that the
+		// runtime mounted from the node into our /run/secrets.
+		transientMounts = append(transientMounts, "/run/secrets:/run/secrets:ro,nodev,noexec,nosuid")
+	}
+
+	options := imagebuildah.BuildOptions{
+		ContextDirectory: contextDir,
+		PullPolicy:       pullPolicy,
+		Isolation:        isolation,
+		TransientMounts:  transientMounts,
+		Args:             args,
+		Output:           opts.Name,
+		Out:              opts.OutputStream,
+		Err:              opts.OutputStream,
+		ReportWriter:     opts.OutputStream,
+		OutputFormat:     buildah.Dockerv2ImageManifest,
+		SystemContext:    &systemContext,
+		NamespaceOptions: buildah.NamespaceOptions{
+			{Name: string(specs.NetworkNamespace), Host: true},
+		},
+		CommonBuildOpts: &buildah.CommonBuildOptions{
+			HTTPProxy:    true,
+			Memory:       opts.Memory,
+			MemorySwap:   opts.Memswap,
+			CgroupParent: opts.CgroupParent,
+			Ulimit:       daemonlessProcessLimits(),
+		},
+		Layers:                  layers,
+		NoCache:                 opts.NoCache,
+		RemoveIntermediateCtrs:  opts.RmTmpContainer,
+		ForceRmIntermediateCtrs: true,
+		BlobDirectory:           blobCacheDirectory,
+		DropCapabilities:        dropCapabilities(),
+	}
+
+	_, _, err := imagebuildah.BuildDockerfiles(opts.Context, store, options, opts.Dockerfile)
+	return err
 }
